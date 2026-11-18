@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openai-agents-wbxsandbox"
+version = "0.1.0"
+description = "WBX Sandbox for OpenAI Agents SDK sandbox agents – run agent work in isolated Linux microVMs"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "WBX Sandbox", email = "info@wbx.cz" }]
+requires-python = ">=3.10"
+keywords = ["openai-agents", "agents", "sandbox", "microvm", "firecracker", "ai agents", "wbx"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "openai-agents>=0.25.0,<0.26",
+    "wbxsandbox>=0.15.7,<0.16",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.urls]
+Homepage = "https://sandbox.wbx.cz"
+Documentation = "https://sandbox.wbx.cz/docs/integrations/openai-agents"
+Repository = "https://github.com/WBX-Sandbox/openai-agents-wbxsandbox"
+Changelog = "https://github.com/WBX-Sandbox/openai-agents-wbxsandbox/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openai_agents_wbxsandbox"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["live: tests against the real WBX Sandbox API (need WBXSANDBOX_API_KEY)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

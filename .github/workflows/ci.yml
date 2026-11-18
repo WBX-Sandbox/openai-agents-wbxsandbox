@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"   # weekly: compatibility with the newest openai-agents
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[test]" ruff
+      - run: ruff check src tests examples && ruff format --check src tests examples
+      - run: pytest -q
+
+  newest-sdk:
+    # Runs the offline tests against the newest openai-agents release, outside the pinned range,
+    # and reports when a new minor version (e.g. 0.26) is out so the pin can be raised.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[test]"
+      - run: pip install -U openai-agents
+      - name: Report a new openai-agents minor version
+        run: |
+          v=$(python -c "import importlib.metadata as m; print(m.version('openai-agents'))")
+          echo "openai-agents $v"
+          case "$v" in
+            0.25.*) echo "still on the tested minor version" ;;
+            *) echo "::warning title=New openai-agents release::openai-agents $v is out – run the live tests and raise the pin in pyproject.toml" ;;
+          esac
+      - run: pytest -q
+
+  live:
+    # Real isolation, filesystem, network and process tests. Needs the WBXSANDBOX_API_KEY secret.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[test]"
+      - run: pytest -q -m live
+        env:
+          WBXSANDBOX_API_KEY: ${{ secrets.WBXSANDBOX_API_KEY }}
