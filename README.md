@@ -80,7 +80,7 @@ put secrets here:
 | `template` | `"base"` | Base image: `base` (Debian, Python 3.12), `code-interpreter`, `node`, `go`, `browser`, … |
 | `name` | – | Named sandbox: an existing sandbox with this name is reused and its workspace kept |
 | `timeout_s` | `3600` | Lifetime in seconds (your plan's maximum applies) |
-| `on_exit` | `"kill"` | `"kill"` deletes the sandbox after the run; `"sleep"` keeps its files for a later resume |
+| `on_exit` | `"kill"` (`"sleep"` with `name`) | `"kill"` deletes the sandbox after the run; `"sleep"` keeps its files for a later resume |
 | `idle_timeout_s` | – | With `on_exit="sleep"`: fall asleep after this many idle seconds |
 | `compute_class` | account default | `economy`, `balanced`, `performance`, `memory`, `dedicated` |
 | `vcpu`, `mem_mb` | template default | Size of the VM |

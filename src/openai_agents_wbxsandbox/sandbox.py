@@ -119,7 +119,8 @@ class WBXSandboxClientOptions(BaseSandboxClientOptions):
     """Lifetime of the sandbox in seconds; the plan's maximum applies."""
     on_exit: Literal["kill", "sleep"] = "kill"
     """What happens when the run ends: ``kill`` deletes the sandbox with its data, ``sleep``
-    keeps its files so the session can be resumed later (also used when the lifetime ends)."""
+    keeps its files so the session can be resumed later (also used when the lifetime ends).
+    Default: ``sleep`` for a named sandbox, otherwise ``kill``."""
     idle_timeout_s: int | None = Field(default=None, ge=60)
     """With ``on_exit="sleep"``: fall asleep after this many seconds without commands."""
     compute_class: Literal["economy", "balanced", "performance", "memory", "dedicated"] | None = (
@@ -149,7 +150,7 @@ class WBXSandboxClientOptions(BaseSandboxClientOptions):
         template: str = "base",
         name: str | None = None,
         timeout_s: int = 3600,
-        on_exit: Literal["kill", "sleep"] = "kill",
+        on_exit: Literal["kill", "sleep"] | None = None,
         idle_timeout_s: int | None = None,
         compute_class: Literal["economy", "balanced", "performance", "memory", "dedicated"]
         | None = None,
@@ -185,6 +186,14 @@ class WBXSandboxClientOptions(BaseSandboxClientOptions):
             exposed_ports=tuple(exposed_ports),
             **unknown,  # rejected by extra="forbid"
         )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_on_exit(cls, data: Any) -> Any:
+        # A named sandbox is meant to be kept: never delete a reused workspace by default.
+        if isinstance(data, dict) and data.get("on_exit") is None:
+            data = {**data, "on_exit": "sleep" if data.get("name") else "kill"}
+        return data
 
     @field_validator("name")
     @classmethod

@@ -40,6 +40,12 @@ def test_options_defaults_and_type():
     assert o.timeout_s == 3600
 
 
+def test_named_sandbox_defaults_to_sleep():
+    assert WBXSandboxClientOptions(name="proj").on_exit == "sleep"
+    assert WBXSandboxClientOptions(name="proj", on_exit="kill").on_exit == "kill"
+    assert BaseSandboxClientOptions.parse({"type": "wbx", "name": "p"}).on_exit == "sleep"
+
+
 def test_options_round_trip_through_registry():
     o = WBXSandboxClientOptions(
         template="node",
