@@ -7,6 +7,7 @@ Every test deletes the sandboxes it creates (also when it fails).
 
 from __future__ import annotations
 
+import http.cookiejar
 import io
 import json
 import os
@@ -164,7 +165,8 @@ async def test_network_allowlist(client):
 
 async def test_network_ipv6(client):
     s = await _start(client, ip="dual")
-    _, out, _ = await _sh(s, "ip -6 addr show scope global | grep -c inet6 || true")
+    # a global IPv6 address on eth0 (the base template has no `ip` command)
+    _, out, _ = await _sh(s, "grep -v -e '^fe80' -e '^0000' /proc/net/if_inet6 | grep -c eth0")
     assert int(out.strip() or 0) >= 1
     out = await _probe(s, "tcp6", "ipv6.google.com")
     assert "OPEN" in out and ":" in out
@@ -255,10 +257,14 @@ async def test_exposed_port_url(client):
     ep = await s.resolve_exposed_port(8000)
     url = ep.url_for("http")
     assert url.startswith("https://") and ep.query
+    # the token moves to a cookie on the first request (redirect), like in a browser
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
     body = ""
     for _ in range(10):
         try:
-            body = urllib.request.urlopen(url, timeout=15).read().decode()
+            body = opener.open(url, timeout=15).read().decode()
             break
         except Exception:  # noqa: BLE001
             time.sleep(2)

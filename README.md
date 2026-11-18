@@ -113,8 +113,10 @@ endpoint = await session.resolve_exposed_port(8000)
 print(endpoint.url_for("http"))     # https://8000-….wbxbox.net/?…token…
 ```
 
-The URL contains an access token. Anyone with the URL can reach the port, so treat it like a
-password. The app must listen on `0.0.0.0`.
+The URL contains an access token. On the first request the token moves to a cookie (a
+redirect), so open it in a browser or with an HTTP client that keeps cookies
+(`requests.Session`, `httpx.Client`, urllib with `HTTPCookieProcessor`). Anyone with the URL can
+reach the port, so treat it like a password. The app must listen on `0.0.0.0`.
 
 ## Lifecycle and resume
 
