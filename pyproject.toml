@@ -9,7 +9,7 @@ description = "WBX Sandbox for OpenAI Agents SDK sandbox agents – run agent wo
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "WBX Sandbox", email = "info@wbx.cz" }]
+authors = [{ name = "KXCOMM s.r.o.", email = "info@wbx.cz" }]
 requires-python = ">=3.10"
 keywords = ["openai-agents", "agents", "sandbox", "microvm", "firecracker", "ai agents", "wbx"]
 classifiers = [
