@@ -2,10 +2,18 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
-  schedule:
-    - cron: "17 5 * * 1"   # weekly: compatibility with the newest openai-agents
   workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1" # weekly: compatibility with the newest openai-agents
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
