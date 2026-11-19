@@ -11,4 +11,6 @@ First release.
 - `on_exit="sleep"` keeps the sandbox's files after the run so a later resume continues in the
   same workspace; named sandboxes (`name=`) are reused across runs.
 - Network policy per sandbox: no network, allowlist, blocklist, IPv4/IPv6.
-- Not supported yet: manifest mounts (S3, GCS, …), PTY sessions.
+- Long-running commands from the shell tool keep running in the VM after `yield_time_ms`; the
+  agent polls them with `write_stdin` and can stop them with Ctrl-C.
+- Not supported yet: manifest mounts (S3, GCS, …), interactive stdin (no terminal device).

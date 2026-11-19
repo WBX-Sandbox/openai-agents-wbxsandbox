@@ -144,6 +144,7 @@ defaults, so states saved by 0.1.x keep working in later 0.x releases.
 | `resume` | reconnect by ID and wake it up; recreate from the snapshot if it is gone |
 | `delete` | delete the sandbox, or put it to sleep with `on_exit="sleep"` |
 | `exec` | run the command with `sh -c` in the workspace (`/workspace` by default) |
+| shell tool (`exec_command`, `write_stdin`) | the command runs in the background in the VM; after `yield_time_ms` the agent gets the output so far and a session ID, then polls it, so long builds and installs are not cut off |
 | `read` / `write` | file download / upload; paths are resolved inside the VM so they cannot leave the workspace |
 | `persist_workspace` / `hydrate_workspace` | tar of the workspace, validated before extraction |
 | exposed ports | public HTTPS URL with an access token |
@@ -157,7 +158,8 @@ machine of the application.
   a mount fails with a clear `ConfigurationError`. Copy the data into the workspace instead.
 * Host path grants (`extra_path_grants` with a host path) are rejected: the sandbox is a remote
   VM.
-* No PTY sessions: the shell tool runs each command to completion (or until its timeout).
+* No terminal device: commands run with stdin closed, so interactive programs (REPLs, prompts)
+  get end-of-file and `write_stdin` only accepts empty input (poll) or Ctrl-C (`\x03`).
 * Command output is captured as UTF-8 text (invalid bytes are replaced) and limited to 16 MB per
   stream. Use file reads for binary data.
 * Background processes stop when the sandbox falls asleep; files are kept.

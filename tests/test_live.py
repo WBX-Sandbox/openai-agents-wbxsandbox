@@ -296,3 +296,35 @@ async def test_runner_end_to_end_with_scripted_model(client):
     assert "Python 3" in json.dumps(model.calls[1].input, default=str)
     after = {s.id for s in wbxsandbox.Sandbox.list()}
     assert after <= before  # the run's sandbox was deleted
+
+
+# ------------------------------------------------------------------ long-running commands
+
+
+async def test_long_command_survives_yield_and_is_polled(client):
+    s = await _start(client, allow=("pypi.org", "files.pythonhosted.org"))
+    u = await s.pty_exec_start(
+        "echo begin; python3 -m pip install -q --root-user-action=ignore pytest; "
+        "sleep 12; python3 -m pytest --version",
+        yield_time_s=2,
+    )
+    assert u.process_id is not None and u.exit_code is None
+    assert b"begin" in u.output
+    out = bytearray(u.output)
+    for _ in range(20):
+        u = await s.pty_write_stdin(session_id=u.process_id, chars="", yield_time_s=10)
+        out += u.output
+        if u.process_id is None:
+            break
+    assert u.exit_code == 0, out.decode(errors="replace")
+    assert b"pytest" in out
+
+
+async def test_ctrl_c_terminates_process(client):
+    s = await _start(client)
+    u = await s.pty_exec_start("sleep 120", yield_time_s=1)
+    assert u.process_id is not None
+    done = await s.pty_write_stdin(session_id=u.process_id, chars="\x03", yield_time_s=5)
+    assert done.process_id is None and done.exit_code not in (None, 0)
+    _, out, _ = await _sh(s, "pgrep -x sleep >/dev/null && echo alive || echo gone")
+    assert "gone" in out

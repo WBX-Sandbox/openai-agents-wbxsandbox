@@ -267,3 +267,88 @@ async def test_named_sandbox_is_reused_and_kept(api, ws_root):
     assert (await s2.read(Path("seed.txt"))).read() == b"edited\n"
     await s2.aclose()
     await client.delete(s2)
+
+
+def _session_id_from(call) -> int:
+    import re
+
+    text = json.dumps(call.input, default=str)
+    return int(re.findall(r"Process running with session ID (\d+)", text)[-1])
+
+
+async def test_long_command_keeps_running_and_is_polled(api, ws_root):
+    """A command longer than yield_time_ms is not killed: the agent polls it with write_stdin."""
+    model = ScriptedModel(
+        [
+            [
+                _exec(
+                    "echo start; sleep 2; echo finished > done.txt; echo end",
+                    "c1",
+                    yield_time_ms=300,
+                )
+            ],
+            ModelStep.respond(
+                lambda call: [
+                    function_call(
+                        "write_stdin",
+                        {"session_id": _session_id_from(call), "chars": "", "yield_time_ms": 8000},
+                        call_id="c2",
+                    )
+                ]
+            ),
+            [assistant_message("ok")],
+        ]
+    )
+    result = await Runner.run(
+        _agent(model, ws_root),
+        "go",
+        run_config=_config(WBXSandboxClient(), options=WBXSandboxClientOptions()),
+    )
+    assert result.final_output == "ok"
+    first = json.dumps(model.calls[1].input, default=str)
+    assert "Process running with session ID" in first and "start" in first
+    second = json.dumps(model.calls[2].input, default=str)
+    assert "Process exited with code 0" in second and "end" in second
+    assert (Path(ws_root) / "done.txt").read_text() == "finished\n"
+    assert api.alive() == []
+
+
+async def test_running_process_is_stopped_at_the_end_of_the_run(api, ws_root):
+    marker = Path(ws_root) / "still-running.txt"
+    model = ScriptedModel(
+        [
+            [_exec(f"sleep 3; touch {marker}", "c1", yield_time_ms=300)],
+            [assistant_message("leaving")],
+        ]
+    )
+    await Runner.run(
+        _agent(model, ws_root),
+        "go",
+        run_config=_config(WBXSandboxClient(), options=WBXSandboxClientOptions()),
+    )
+    await asyncio.sleep(4)
+    assert not marker.exists()  # the process group was terminated
+    assert api.alive() == []
+
+
+async def test_process_session_direct_api(api, ws_root):
+    client = WBXSandboxClient()
+    session = await client.create(manifest=Manifest(root=ws_root), options=None)
+    async with session:
+        u = await session.pty_exec_start("printf 'a\\nb\\n'; exit 4", yield_time_s=5)
+        assert u.process_id is None and u.exit_code == 4 and u.output == b"a\nb\n"
+        u = await session.pty_exec_start("sleep 30", yield_time_s=0.3)
+        assert u.process_id is not None and u.exit_code is None
+        with pytest.raises(RuntimeError, match="stdin is not available"):
+            await session.pty_write_stdin(session_id=u.process_id, chars="hello\n")
+        u2 = await session.pty_write_stdin(session_id=u.process_id, chars="\x03", yield_time_s=5)
+        assert u2.process_id is None and u2.exit_code not in (None, 0)  # interrupted
+        from agents.sandbox.errors import PtySessionNotFoundError
+
+        with pytest.raises(PtySessionNotFoundError):
+            await session.pty_write_stdin(session_id=u.process_id, chars="")
+        big = await session.pty_exec_start(
+            "head -c 3000000 /dev/zero | tr '\\0' x", yield_time_s=20
+        )
+        assert big.exit_code == 0 and len(big.output) == 3_000_000
+    await client.delete(session)

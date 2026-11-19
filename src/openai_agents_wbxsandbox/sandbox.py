@@ -8,13 +8,17 @@ worker thread and never block the event loop.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import os
 import re
 import shlex
+import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit
@@ -26,6 +30,7 @@ from agents.sandbox.errors import (
     ExecTimeoutError,
     ExecTransportError,
     ExposedPortUnavailableError,
+    PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
@@ -36,6 +41,15 @@ from agents.sandbox.manifest import Manifest
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.dependencies import Dependencies
 from agents.sandbox.session.manager import Instrumentation
+from agents.sandbox.session.pty_output import collect_pty_output
+from agents.sandbox.session.pty_types import (
+    PTY_PROCESSES_MAX,
+    PtyExecUpdate,
+    allocate_pty_process_id,
+    clamp_pty_yield_time_ms,
+    process_id_to_prune_from_meta,
+    resolve_pty_write_yield_time_ms,
+)
 from agents.sandbox.session.runtime_helpers import (
     RESOLVE_WORKSPACE_PATH_HELPER,
     RuntimeHelperScript,
@@ -64,6 +78,55 @@ _SHUTDOWN_ATTEMPTS = 3
 _EXEC_TRANSPORT_MARGIN_S = 60.0
 _FAST_OP_TIMEOUT_S = 60.0
 _ARCHIVE_TIMEOUT_S = 600.0
+# Long-running commands: started in the background inside the VM, output read by polling.
+_PROC_ROOT = "/tmp/wbx-oa-proc"
+_POLL_MAX_WAIT_S = 5.0  # one poll waits inside the VM at most this long for news
+_POLL_CHUNK_BYTES = 1024 * 1024
+
+# Starts a command detached from the request: output to $d/out, exit code to $d/rc.
+_LAUNCH_SH = r"""
+d="$1"; mkdir -p "$d" || exit 90
+if command -v setsid >/dev/null 2>&1; then s=setsid; else s=; fi
+nohup $s sh -c 'sh -c "$1"; echo $? > "$2/rc.tmp" && mv "$2/rc.tmp" "$2/rc"' wbx "$2" "$d" \
+  > "$d/out" 2>&1 < /dev/null &
+echo $! > "$d/pid"
+"""
+
+# Waits up to $3 ticks of 0.2 s for the process to end or to print something new, then reports
+# "S <size> R <exit code or -> " and the new output from byte offset $2 as base64.
+_POLL_SH = r"""
+d="$1"; off="$2"; ticks="$3"; max="$4"
+[ -d "$d" ] || { echo GONE; exit 0; }
+i=0; grew=0
+while [ "$i" -lt "$ticks" ]; do
+  [ -f "$d/rc" ] && break
+  sz=$(stat -c %s "$d/out" 2>/dev/null || echo 0)
+  if [ "$sz" -gt "$off" ]; then grew=$((grew+1)); [ "$grew" -ge 3 ] && break; fi
+  sleep 0.2; i=$((i+1))
+done
+rc=$(cat "$d/rc" 2>/dev/null)
+sz=$(stat -c %s "$d/out" 2>/dev/null || echo 0)
+echo "S $sz R ${rc:--}"
+tail -c +$((off+1)) "$d/out" 2>/dev/null | head -c "$max" | base64 | tr -d '\n'
+echo
+"""
+
+# Stops the process groups of the given process directories ($1 = "keep": leave the directory
+# so the exit code can still be read; otherwise remove it).
+_KILL_SH = r"""
+keep="$1"; shift
+for d in "$@"; do
+  if [ -f "$d/pid" ] && [ ! -f "$d/rc" ]; then
+    p=$(cat "$d/pid"); kill -TERM -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+    if [ "$keep" = keep ]; then
+      # the wrapper that records the exit code was terminated too: record 143 (SIGTERM)
+      sleep 0.3; [ -f "$d/rc" ] || { echo 143 > "$d/rc.k" && mv "$d/rc.k" "$d/rc"; }
+    fi
+  fi
+  [ "$keep" = keep ] || rm -rf -- "$d"
+done
+true
+"""
 
 T = TypeVar("T")
 
@@ -260,6 +323,21 @@ class WBXSandboxSessionState(SandboxSessionState):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
+@dataclass(eq=False)
+class _WBXProcess:
+    """A command running in the background inside the VM (non-interactive process session)."""
+
+    directory: str
+    offset: int = 0
+    exit_code: int | None = None
+    done: bool = False
+    last_used: float = field(default_factory=time.monotonic)
+    chunks: deque[bytes] = field(default_factory=deque)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    notify: asyncio.Event = field(default_factory=asyncio.Event)
+    poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class WBXSandboxSession(BaseSandboxSession):
     """A live session in one WBX sandbox."""
 
@@ -279,6 +357,9 @@ class WBXSandboxSession(BaseSandboxSession):
         self._secret_env = dict(secret_env or {})
         self._backend_released = False
         self._release_lock = asyncio.Lock()
+        self._processes: dict[int, _WBXProcess] = {}
+        self._process_ids: set[int] = set()
+        self._process_lock = asyncio.Lock()
 
     @property
     def sandbox_id(self) -> str:
@@ -404,6 +485,202 @@ class WBXSandboxSession(BaseSandboxSession):
             stderr=result.stderr.encode("utf-8", errors="replace"),
             exit_code=int(result.exit_code),
         )
+
+    # ------------------------------------------------------------------ processes
+    #
+    # The shell tool calls these when supports_pty() is True. A command keeps running in the VM
+    # after ``yield_time_ms``; the agent gets the output so far and a process ID, and reads more
+    # with ``write_stdin`` (empty input). There is no terminal: stdin is closed, so interactive
+    # programs get end-of-file. Ctrl-C (``\x03``) terminates the process.
+
+    def supports_pty(self) -> bool:
+        return True
+
+    async def _sh_script(self, script: str, *args: str, timeout: float) -> wbxsandbox.CommandResult:
+        quoted = " ".join(shlex.quote(a) for a in args)
+        cmd = f"sh -c {shlex.quote(script)} wbx {quoted}"
+        return await self._run_raw(cmd, cwd=None, timeout=timeout)
+
+    async def pty_exec_start(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+        shell: bool | list[str] = True,
+        user: str | User | None = None,
+        tty: bool = False,
+        yield_time_s: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> PtyExecUpdate:
+        _ = tty  # no terminal device: the process runs with stdin closed either way
+        sanitized = self._prepare_exec_command(*command, shell=shell, user=user)
+        root = sandbox_path_str(self.state.manifest.root)
+        cmd_str = f"cd {shlex.quote(root)} && exec {shlex.join(str(p) for p in sanitized)}"
+        proc = _WBXProcess(directory=f"{_PROC_ROOT}/{uuid.uuid4().hex}")
+        launch_timeout = 60.0 if timeout is None else max(1.0, min(float(timeout), 60.0))
+        try:
+            result = await self._sh_script(
+                _LAUNCH_SH, proc.directory, cmd_str, timeout=launch_timeout
+            )
+        except asyncio.TimeoutError as e:
+            raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
+        except Exception as e:
+            raise ExecTransportError(
+                command=command, context=_context(e), cause=e, retryable=_retryable(e)
+            ) from e
+        if result.timed_out or result.exit_code != 0:
+            raise ExecTransportError(
+                command=command,
+                context={
+                    "backend": BACKEND_ID,
+                    "reason": "background_start_failed",
+                    "exit_code": result.exit_code,
+                    "stderr": result.stderr[:2000],
+                },
+            )
+
+        async with self._process_lock:
+            process_id = allocate_pty_process_id(self._process_ids)
+            self._process_ids.add(process_id)
+            pruned = self._prune_processes_if_needed()
+            self._processes[process_id] = proc
+            count = len(self._processes)
+        if pruned is not None:
+            await self._stop_processes([pruned])
+        if count >= PTY_PROCESSES_MAX - 4:
+            logger.warning("WBX sandbox %s: %s background processes", self.sandbox_id, count)
+
+        yield_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+        return await self._collect(
+            process_id, proc, clamp_pty_yield_time_ms(yield_ms), max_output_tokens
+        )
+
+    async def pty_write_stdin(
+        self,
+        *,
+        session_id: int,
+        chars: str,
+        yield_time_s: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> PtyExecUpdate:
+        proc = self._processes.get(session_id)
+        if proc is None:
+            raise PtySessionNotFoundError(session_id=session_id)
+        if chars:
+            if chars.strip("\x03") == "" and not proc.done:
+                # Background jobs ignore SIGINT (POSIX), so Ctrl-C terminates the group.
+                await self._sh_script(_KILL_SH, "keep", proc.directory, timeout=30)
+            elif chars.strip("\x03") != "":
+                raise RuntimeError("stdin is not available for this process")
+        yield_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+        yield_ms = resolve_pty_write_yield_time_ms(yield_time_ms=yield_ms, input_empty=not chars)
+        return await self._collect(session_id, proc, yield_ms, max_output_tokens)
+
+    async def pty_terminate_all(self) -> None:
+        async with self._process_lock:
+            procs = list(self._processes.values())
+            self._processes.clear()
+            self._process_ids.clear()
+        if procs and not self._backend_released:
+            await self._stop_processes(procs)
+
+    async def _collect(
+        self, process_id: int, proc: _WBXProcess, yield_ms: int, max_output_tokens: int | None
+    ) -> PtyExecUpdate:
+        proc.last_used = time.monotonic()
+
+        async def poll(deadline: float) -> None:
+            await self._poll_process(proc, deadline)
+
+        async def no_wait(_: float) -> None:
+            return None  # poll() already waits inside the VM
+
+        output, original_token_count, closed = await collect_pty_output(
+            output_chunks=proc.chunks,
+            output_lock=proc.lock,
+            output_notify=proc.notify,
+            is_done=lambda: proc.done,
+            yield_time_ms=yield_ms,
+            max_output_tokens=max_output_tokens,
+            poll_output=poll,
+            wait_for_output=no_wait,
+        )
+        if not closed:
+            return PtyExecUpdate(
+                process_id=process_id,
+                output=output,
+                exit_code=None,
+                original_token_count=original_token_count,
+            )
+        async with self._process_lock:
+            removed = self._processes.pop(process_id, None)
+            self._process_ids.discard(process_id)
+        if removed is not None:
+            await self._stop_processes([removed])  # only removes its directory now
+        return PtyExecUpdate(
+            process_id=None,
+            output=output,
+            exit_code=proc.exit_code,
+            original_token_count=original_token_count,
+        )
+
+    async def _poll_process(self, proc: _WBXProcess, deadline: float) -> None:
+        if proc.done:
+            return
+        async with proc.poll_lock:
+            if proc.done:
+                return
+            remaining = max(0.0, min(deadline - time.monotonic(), _POLL_MAX_WAIT_S))
+            ticks = int(remaining / 0.2)
+            result = await self._sh_script(
+                _POLL_SH,
+                proc.directory,
+                str(proc.offset),
+                str(ticks),
+                str(_POLL_CHUNK_BYTES),
+                timeout=remaining + 30,
+            )
+            lines = result.stdout.split("\n")
+            head = lines[0].split() if lines else []
+            if head[:1] == ["GONE"]:
+                proc.done = True  # the VM lost the process (e.g. it slept or was replaced)
+                proc.notify.set()
+                return
+            if len(head) != 4 or head[0] != "S" or head[2] != "R":
+                raise ExecTransportError(
+                    command=("poll",),
+                    context={
+                        "backend": BACKEND_ID,
+                        "reason": "unexpected_poll_output",
+                        "stderr": result.stderr[:500],
+                    },
+                )
+            size, rc = int(head[1]), head[3]
+            data = base64.b64decode(lines[1]) if len(lines) > 1 and lines[1] else b""
+            if data:
+                async with proc.lock:
+                    proc.chunks.append(data)
+                proc.offset += len(data)
+                proc.notify.set()
+            if rc != "-" and proc.offset >= size:
+                proc.exit_code = int(rc)
+                proc.done = True
+                proc.notify.set()
+
+    def _prune_processes_if_needed(self) -> _WBXProcess | None:
+        if len(self._processes) < PTY_PROCESSES_MAX:
+            return None
+        meta = [(pid, p.last_used, p.done) for pid, p in self._processes.items()]
+        pid = process_id_to_prune_from_meta(meta)
+        if pid is None:
+            return None
+        self._process_ids.discard(pid)
+        return self._processes.pop(pid, None)
+
+    async def _stop_processes(self, procs: list[_WBXProcess]) -> None:
+        try:
+            await self._sh_script(_KILL_SH, "remove", *(p.directory for p in procs), timeout=30)
+        except Exception as e:  # best effort; the directories are in /tmp of a disposable VM
+            logger.debug("WBX sandbox %s: process cleanup failed: %s", self.sandbox_id, e)
 
     # ------------------------------------------------------------------ files
 
