@@ -3,7 +3,24 @@
 [WBX Sandbox](https://sandbox.wbx.cz) as a hosted sandbox for
 [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) sandbox agents.
 Each sandbox is an isolated Linux microVM with its own kernel, disk and network policy. The
-agent's shell and file tools run there, not on your machine.
+agent's shell and file tools run there, not on your machine. One package, one line in the run
+configuration.
+
+What you get with WBX Sandbox as the backend:
+
+- **Isolation** – a Firecracker microVM per sandbox on servers in the EU; the agent is root
+  inside the VM and can install anything with `pip`, `npm` or `apt`
+- **Persistent workspaces** – a named sandbox falls asleep after the run with its files kept and
+  no compute billed, and the next run wakes it up in the same workspace
+- **Network policy** – full internet, an allowlist or no network at all, and an optional public
+  IPv6 address of the sandbox's own
+- **Public HTTPS URLs** for ports the agent serves, protected by an access token
+- **Compute classes** per run (economy to performance and high-memory), billing per second ([pricing](https://sandbox.wbx.cz/pricing))
+- Long-running commands keep going in the VM while the agent polls their output
+
+Documentation: [OpenAI Agents SDK integration](https://sandbox.wbx.cz/docs/integrations/openai-agents) ·
+[WBX Sandbox docs](https://sandbox.wbx.cz/docs). The same account also gives you background jobs
+and batches, signed execution receipts, metrics and an MCP server for AI assistants.
 
 ```bash
 pip install openai-agents-wbxsandbox
@@ -83,7 +100,7 @@ put secrets here:
 | `on_exit` | `"kill"` (`"sleep"` with `name`) | `"kill"` deletes the sandbox after the run; `"sleep"` keeps its files for a later resume |
 | `idle_timeout_s` | – | With `on_exit="sleep"`: fall asleep after this many idle seconds |
 | `compute_class` | account default | `economy`, `balanced`, `performance`, `memory`, `dedicated` |
-| `vcpu`, `mem_mb` | template default | Size of the VM |
+| `vcpu`, `mem_mb` | template default | Size of the VM – only for templates without a fixed size (all standard templates have one) |
 | `internet` | `True` | `False` = no network at all |
 | `allow` | – | Allowlist of reachable domains or addresses |
 | `block` | – | Additional blocked destinations |
